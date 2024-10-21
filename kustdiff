@@ -31,6 +31,11 @@ function build {
 	git checkout "$ref" --quiet
 	mkdir -p "$TMP_DIR/$safe_ref"
 	for envpath in $(get_targets); do
+		if [[ "$envpath" == *"component"* ]]; then
+			echo "Skipping: envpath contains 'component'"
+			continue
+		fi
+
 		local relative_path="${envpath#$ROOT_DIR/}"
 		local safe_path=$(safe_filename "$relative_path")
 		local output_file="$TMP_DIR/$safe_ref/${safe_path}.yaml"
