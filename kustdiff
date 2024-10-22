@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-
 set -eux
 
-TMP_DIR="$(mktemp -d)"
 ROOT_DIR="${1:-./kustomize}" # Default to ./kustomize if no argument is provided
 DEBUG="${DEBUG:-true}"
+TMP_DIR="$(mktemp -d)"
 
 function debug_log() {
 	if [ "$DEBUG" = "true" ]; then
@@ -12,7 +11,7 @@ function debug_log() {
 	fi
 }
 
-function get_targets {
+function get_targets() {
 	find "$ROOT_DIR" -maxdepth 4 -name kustomization.yaml -exec dirname {} \;
 }
 
@@ -20,75 +19,76 @@ function safe_dirname() {
 	echo "$1" | sed 's/[^a-zA-Z0-9.]/_/g'
 }
 
-function safe_filename() {
-	echo "$1" | sed 's/[^a-zA-Z0-9.]/_/g'
-}
+function main() {
+	git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-function build {
-	local ref="$1"
-	local safe_ref=$(safe_filename "$ref")
-	echo "Checking out ref: $ref"
-	git checkout "$ref" --quiet
-	mkdir -p "$TMP_DIR/$safe_ref"
-	for envpath in $(get_targets); do
+	local all_diffs=""
+	local exit_status=0
+
+	# Create temporary directories for both refs
+	local base_dir="$TMP_DIR/base"
+	local head_dir="$TMP_DIR/head"
+
+	debug_log "Creating temporary directories for comparison"
+	mkdir -p "$base_dir" "$head_dir"
+
+	# Get list of kustomization directories
+	local targets
+	targets=$(get_targets)
+
+	for envpath in $targets; do
 		if [[ "$envpath" == *"component"* ]]; then
 			echo "Skipping: envpath contains 'component'"
 			continue
 		fi
 
 		local relative_path="${envpath#$ROOT_DIR/}"
-		local safe_path=$(safe_filename "$relative_path")
-		local output_file="$TMP_DIR/$safe_ref/${safe_path}.yaml"
-		echo "Running kustomize for $envpath"
-		kustomize build "$envpath" -o "$output_file"
+		debug_log "Processing directory: $relative_path"
 
-		#    debug_log "Contents of $output_file:"
-		#    debug_log "$(cat "$output_file")"
-		#    debug_log "End of $output_file"
-		#    debug_log "------------------------------------"
+		# Create the same directory structure in both temp locations
+		mkdir -p "$base_dir/$relative_path" "$head_dir/$relative_path"
+
+		# Copy kustomization files for both refs
+		git checkout "$INPUT_BASE_REF" --quiet
+		cp -r "$envpath"/* "$base_dir/$relative_path/"
+
+		git checkout "$INPUT_HEAD_REF" --quiet
+		cp -r "$envpath"/* "$head_dir/$relative_path/"
+
+		debug_log "Running kustomize-diff for $relative_path"
+
+		# Run kustomize-diff inline comparison
+		local diff_output
+		if ! diff_output=$(kustomize-diff inline "$base_dir/$relative_path" "$head_dir/$relative_path" --no-color 2>&1); then
+			exit_status=1
+			debug_log "Found differences in $relative_path"
+		fi
+
+		if [ -n "$diff_output" ]; then
+			all_diffs+="Directory: $relative_path\n$diff_output\n\n"
+		fi
 	done
-}
 
-function main {
-	git config --global --add safe.directory "$GITHUB_WORKSPACE"
-	local diff escaped_output output
-	build "$INPUT_HEAD_REF"
-	build "$INPUT_BASE_REF"
-
-	local safe_head_ref=$(safe_dirname "$INPUT_HEAD_REF")
-	local safe_base_ref=$(safe_dirname "$INPUT_BASE_REF")
-
-	set +e
-	diff=$(git diff --no-index "$TMP_DIR/$safe_base_ref" "$TMP_DIR/$safe_head_ref")
-
-	debug_log "Git diff output:"
-	debug_log "$diff"
-	debug_log "End of git diff output"
-	debug_log "------------------------------------"
-
-	if [[ -z "$diff" ]]; then
+	local output
+	if [ $exit_status -eq 0 ] && [ -z "$all_diffs" ]; then
 		output="No differences found between $INPUT_BASE_REF and $INPUT_HEAD_REF"
 	else
-		output=$(printf "Differences between %s and %s:\n\`\`\`diff\n%s\n\`\`\`\n" "$INPUT_BASE_REF" "$INPUT_HEAD_REF" "$diff")
+		output=$(printf "Differences between %s and %s:\n\`\`\`diff\n%s\`\`\`\n" "$INPUT_BASE_REF" "$INPUT_HEAD_REF" "$all_diffs")
 	fi
 
-	set -e
-	output=$(printf "\`\`\` diff\n%s\n\`\`\`\n" "$diff")
-	escaped_output=${output//$'\n'/'%0A'}
+	# Escape the output for GitHub Actions
+	local escaped_output=${output//$'\n'/'%0A'}
 
-	# If escaped output is longer than 65000 characters return "output to large to print as a github comment"
+	# Check if output is too large
 	if [ ${#escaped_output} -gt 65000 ]; then
 		escaped_output="Output is greater than 65000 characters, and therefore too large to print as a github comment."
 	fi
 
 	echo "::set-output name=diff::$escaped_output"
 	printf "\n\nOutput: %s\n" "$escaped_output"
-}
 
-# Check if a directory is provided as an argument
-if [ $# -ge 1 ]; then
-	ROOT_DIR="$1"
-fi
+	exit $exit_status
+}
 
 echo "Using root directory: $ROOT_DIR"
 debug_log "Debug mode is enabled"
